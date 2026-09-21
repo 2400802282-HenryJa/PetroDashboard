@@ -32,19 +32,12 @@ cursor = conn.cursor()
 cursor.execute(
     """
     CREATE TABLE IF NOT EXISTS wells (
-
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-
         well_name TEXT,
-
         company TEXT,
-
         depth_samples INTEGER,
-
         average_vsh REAL,
-
         net_to_gross REAL
-
     )
     """
 )
@@ -389,21 +382,9 @@ if uploaded_file is not None:
                 row=1,
                 col=3
             )
-
-        if "NPHI" in df.columns:
-
-            fig.add_trace(
-                go.Scatter(
-                    x=df["NPHI"],
-                    y=depth,
-                    mode="lines",
-                    name="NPHI",
-                    line=dict(
-                        color="purple"
-                    )
-                ),
-                row=1,
-                col=3
+        else:
+            st.warning(
+                "No RHOB log detected."
             )
 
         # ----------------------------------------
@@ -419,7 +400,7 @@ if uploaded_file is not None:
                     mode="lines",
                     name="VSH",
                     line=dict(
-                        color="brown"
+                        color="black"
                     )
                 ),
                 row=1,
@@ -427,369 +408,35 @@ if uploaded_file is not None:
             )
 
         # ----------------------------------------
-        # REVERSE DEPTH AXIS
+        # GLOBAL FIGURE LAYOUT ADJUSTMENTS
         # ----------------------------------------
-
-        fig.update_yaxes(
-            autorange="reversed"
-        )
-
-        # ----------------------------------------
-        # LAYOUT
-        # ----------------------------------------
-
+        
         fig.update_layout(
-            height=1000,
-            title_text=(
-                "Formation Evaluation Dashboard"
-            ),
-            showlegend=True
+            height=800,
+            width=1000,
+            yaxis=dict(
+                title="Depth",
+                autorange="reverse"  # Deepest depths at the bottom
+            )
         )
-
-        # ----------------------------------------
-        # DISPLAY PLOT
-        # ----------------------------------------
-
+        
         st.plotly_chart(
-            fig,
-            width="stretch"
+            fig, 
+            use_container_width=True
         )
 
         # ----------------------------------------
-        # SAVE TO DATABASE
+        # DB LOGGING STORAGE OPERATION
         # ----------------------------------------
-
-        if st.button(
-            "Save Well To Database"
-        ):
-
-            cursor.execute(
-                """
-                INSERT INTO wells (
-
-                    well_name,
-                    company,
-                    depth_samples,
-                    average_vsh,
-                    net_to_gross
-
-                )
-
-                VALUES (?, ?, ?, ?, ?)
-                """,
-
-                (
-                    well_name,
-                    company,
-                    len(df),
-                    float(avg_vsh),
-                    float(ntg)
-                )
-            )
-
-            conn.commit()
-
-            st.success(
-                "Well saved to database successfully!"
-            )
-
-        # ----------------------------------------
-        # DISPLAY DATABASE CONTENTS
-        # ----------------------------------------
-
-        st.subheader(
-            "Saved Wells Database"
+        
+        cursor.execute(
+            """
+            INSERT INTO wells (well_name, company, depth_samples, average_vsh, net_to_gross)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (well_name, company, int(len(df)), float(avg_vsh), float(ntg))
         )
-
-        saved_wells = pd.read_sql_query(
-            "SELECT * FROM wells",
-            conn
-        )
-
-        st.dataframe(
-            saved_wells
-        )
-
-        # ----------------------------------------
-        # MULTI-WELL ANALYSIS
-        # ----------------------------------------
-
-        st.subheader(
-            "Multi-Well Analysis"
-        )
-
-        multi_df = pd.read_sql_query(
-            "SELECT * FROM wells",
-            conn
-        )
-
-        if len(multi_df) > 0:
-
-            st.write(
-                "Stored Wells Overview"
-            )
-
-            st.dataframe(
-                multi_df
-            )
-
-            # ----------------------------------------
-            # BEST NTG WELL
-            # ----------------------------------------
-
-            best_ntg_well = multi_df.loc[
-                multi_df[
-                    "net_to_gross"
-                ].idxmax()
-            ]
-
-            st.success(
-                f"Best Reservoir Quality Well: "
-                f"{best_ntg_well['well_name']}"
-            )
-
-            # ----------------------------------------
-            # NTG BAR CHART
-            # ----------------------------------------
-
-            st.subheader(
-                "Net-to-Gross Comparison"
-            )
-
-            fig_ntg, ax_ntg = plt.subplots()
-
-            ax_ntg.bar(
-                multi_df["well_name"],
-                multi_df["net_to_gross"]
-            )
-
-            ax_ntg.set_xlabel(
-                "Well Name"
-            )
-
-            ax_ntg.set_ylabel(
-                "Net-to-Gross"
-            )
-
-            ax_ntg.set_title(
-                "NTG Comparison Across Wells"
-            )
-
-            st.pyplot(
-                fig_ntg
-            )
-
-            # ----------------------------------------
-            # VSH BAR CHART
-            # ----------------------------------------
-
-            st.subheader(
-                "Average VSH Comparison"
-            )
-
-            fig_vsh, ax_vsh = plt.subplots()
-
-            ax_vsh.bar(
-                multi_df["well_name"],
-                multi_df["average_vsh"]
-            )
-
-            ax_vsh.set_xlabel(
-                "Well Name"
-            )
-
-            ax_vsh.set_ylabel(
-                "Average VSH"
-            )
-
-            ax_vsh.set_title(
-                "Average VSH Across Wells"
-            )
-
-            st.pyplot(
-                fig_vsh
-            )
-
-        else:
-
-            st.warning(
-                "No wells saved yet."
-            )
-
-        # ----------------------------------------
-        # FORMATION TABLE
-        # ----------------------------------------
-
-        st.subheader(
-            "Formation Evaluation Table"
-        )
-
-        if "VSH" in df.columns:
-
-            st.dataframe(
-                df[
-                    [
-                        depth.name,
-                        "GR",
-                        "VSH",
-                        "RES_FLAG"
-                    ]
-                ].head(50)
-            )
-
-        # ----------------------------------------
-        # AI LITHOLOGY PREDICTION
-        # ----------------------------------------
-
-        st.subheader(
-            "AI Lithology Prediction"
-        )
-
-        required_logs = [
-            "GR",
-            "RHOB",
-            "NPHI"
-        ]
-
-        if all(
-            log in df.columns
-            for log in required_logs
-        ):
-
-            # ----------------------------------------
-            # CREATE LABELS
-            # ----------------------------------------
-
-            df["LITH_LABEL"] = np.where(
-                df["GR"] < gr_cutoff,
-                1,
-                0
-            )
-
-            # ----------------------------------------
-            # FEATURES
-            # ----------------------------------------
-
-            X = df[
-                [
-                    "GR",
-                    "RHOB",
-                    "NPHI"
-                ]
-            ].fillna(0)
-
-            y = df["LITH_LABEL"]
-
-            # ----------------------------------------
-            # TRAIN TEST SPLIT
-            # ----------------------------------------
-
-            X_train, X_test, y_train, y_test = (
-                train_test_split(
-                    X,
-                    y,
-                    test_size=0.2,
-                    random_state=42
-                )
-            )
-
-            # ----------------------------------------
-            # MODEL
-            # ----------------------------------------
-
-            model = RandomForestClassifier()
-
-            model.fit(
-                X_train,
-                y_train
-            )
-
-            # ----------------------------------------
-            # PREDICTIONS
-            # ----------------------------------------
-
-            predictions = model.predict(
-                X_test
-            )
-
-            accuracy = accuracy_score(
-                y_test,
-                predictions
-            )
-
-            st.metric(
-                "Lithology Prediction Accuracy",
-                f"{accuracy:.2f}"
-            )
-
-            # ----------------------------------------
-            # PREDICT ENTIRE WELL
-            # ----------------------------------------
-
-            df["AI_LITH"] = model.predict(X)
-
-            # ----------------------------------------
-            # DISPLAY RESULTS
-            # ----------------------------------------
-
-            st.write(
-                "AI Lithology Predictions"
-            )
-
-            st.dataframe(
-                df[
-                    [
-                        depth.name,
-                        "GR",
-                        "RHOB",
-                        "NPHI",
-                        "AI_LITH"
-                    ]
-                ].head(50)
-            )
-
-            # ----------------------------------------
-            # AI LITHOLOGY PLOT
-            # ----------------------------------------
-
-            st.subheader(
-                "AI Lithology Track"
-            )
-
-            fig_ai, ax_ai = plt.subplots()
-
-            ax_ai.plot(
-                df["AI_LITH"],
-                depth
-            )
-
-            ax_ai.invert_yaxis()
-
-            ax_ai.set_xlabel(
-                "Lithology"
-            )
-
-            ax_ai.set_ylabel(
-                "Depth"
-            )
-
-            ax_ai.set_title(
-                "AI Predicted Lithology"
-            )
-
-            st.pyplot(
-                fig_ai
-            )
-
-        else:
-
-            st.warning(
-                "GR, RHOB, and NPHI logs "
-                "required for AI prediction."
-            )
+        conn.commit()
+        st.info("Analysis metric details successfully logged to database storage.")
 
     except Exception as e:
-
-        st.error(
-            f"Error reading LAS file: {e}"
-        )
