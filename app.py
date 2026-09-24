@@ -65,6 +65,32 @@ RESISTIVITY_KEYWORDS = [
     "RILD"
 ]
 
+DEPTH_KEYWORDS = [
+    "DEPT",
+    "DEPTH",
+    "MD",
+    "TVD"
+]
+
+GR_KEYWORDS = [
+    "GR",
+    "GAM",
+    "GAMMA"
+]
+
+RHOB_KEYWORDS = [
+    "RHOB",
+    "RHOZ",
+    "DEN"
+]
+
+NPHI_KEYWORDS = [
+    "NPHI",
+    "TNPH",
+    "NPOR",
+    "CNPOR"
+]
+
 
 # ============================================================
 # 4. DATABASE PATH
@@ -102,7 +128,6 @@ def initialize_database():
     )
 
     conn.commit()
-
     conn.close()
 
 
@@ -137,16 +162,15 @@ def save_well_analysis(
         VALUES (?, ?, ?, ?, ?)
         """,
         (
-            well_name,
-            company,
-            depth_samples,
-            average_vsh,
-            net_to_gross
+            str(well_name),
+            str(company),
+            int(depth_samples),
+            float(average_vsh),
+            float(net_to_gross)
         )
     )
 
     conn.commit()
-
     conn.close()
 
 
@@ -172,7 +196,36 @@ def load_saved_wells():
 
 
 # ============================================================
-# 8. LAS FILE LOADING
+# 8. ARROW-SAFE DATAFRAME
+# ============================================================
+
+def make_arrow_safe_dataframe(df):
+    """
+    Make mixed/object columns safe for Streamlit and PyArrow.
+
+    This prevents errors such as:
+    Expected bytes, got a 'int' object
+    """
+
+    safe_df = df.copy()
+
+    for column in safe_df.columns:
+
+        if safe_df[column].dtype == "object":
+
+            safe_df[column] = safe_df[column].map(
+                lambda value: (
+                    ""
+                    if pd.isna(value)
+                    else str(value)
+                )
+            )
+
+    return safe_df
+
+
+# ============================================================
+# 9. LAS FILE LOADING
 # ============================================================
 
 def load_las_file(uploaded_file):
@@ -180,7 +233,15 @@ def load_las_file(uploaded_file):
     Convert uploaded LAS file into a lasio object.
     """
 
-    las_string = uploaded_file.getvalue().decode(
+    file_bytes = uploaded_file.getvalue()
+
+    if not file_bytes:
+
+        raise ValueError(
+            "The uploaded LAS file is empty."
+        )
+
+    las_string = file_bytes.decode(
         "utf-8",
         errors="ignore"
     )
@@ -198,83 +259,151 @@ def load_las_file(uploaded_file):
 
 
 # ============================================================
-# 9. LAS → DATAFRAME
+# 10. LAS → DATAFRAME
 # ============================================================
 
 def las_to_dataframe(las):
     """
-    Convert LAS data into a Pandas DataFrame.
+    Convert LAS data into a clean Pandas DataFrame.
     """
 
     df = las.df()
 
-    df.reset_index(
-        inplace=True
-    )
+    df = df.reset_index()
+
+    # Remove duplicate column names if any exist.
+    df = df.loc[
+        :,
+        ~df.columns.duplicated()
+    ]
+
+    # Convert numeric-looking log columns to numeric.
+    for column in df.columns:
+
+        if column == df.columns[0]:
+            continue
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
 
     return df
 
 
 # ============================================================
-# 10. WELL INFORMATION EXTRACTION
+# 11. WELL INFORMATION EXTRACTION
 # ============================================================
 
 def get_well_information(las):
     """
-    Extract basic well metadata.
+    Extract basic well metadata safely.
     """
 
-    if "WELL" in las.well:
+    well_name = "Unknown"
+    company = "Unknown"
 
-        well_name = str(
-            las.well.WELL.value
-        )
+    try:
 
-    else:
+        if "WELL" in las.well:
 
+            value = las.well.WELL.value
+
+            if value is not None:
+                well_name = str(value).strip()
+
+    except Exception:
+        pass
+
+    try:
+
+        if "COMP" in las.well:
+
+            value = las.well.COMP.value
+
+            if value is not None:
+                company = str(value).strip()
+
+    except Exception:
+        pass
+
+    if not well_name:
         well_name = "Unknown"
 
-    if "COMP" in las.well:
-
-        company = str(
-            las.well.COMP.value
-        )
-
-    else:
-
+    if not company:
         company = "Unknown"
 
     return well_name, company
 
 
 # ============================================================
-# 11. DEPTH COLUMN DETECTION
+# 12. DEPTH COLUMN DETECTION
 # ============================================================
 
 def get_depth_column(df):
     """
-    Identify the depth/index column.
+    Identify the most likely depth column.
     """
 
-    return df.columns[0]
+    columns = list(df.columns)
 
+    for keyword in DEPTH_KEYWORDS:
 
-# ============================================================
-# 12. RESISTIVITY CURVE DETECTION
-# ============================================================
+        for column in columns:
 
-def find_resistivity_curve(df):
-    """
-    Automatically identify a resistivity curve.
-    """
+            if str(column).upper().strip() == keyword:
 
-    for column in df.columns:
+                return column
+
+    for column in columns:
 
         column_upper = str(
             column
         ).upper()
 
-        for keyword in RESISTIVITY_KEYWORDS:
+        if any(
+            keyword in column_upper
+            for keyword in DEPTH_KEYWORDS
+        ):
+
+            return column
+
+    # LAS reset_index() normally places depth first.
+    return columns[0]
+
+
+# ============================================================
+# 13. GENERIC CURVE DETECTION
+# ============================================================
+
+def find_curve(
+    df,
+    keywords
+):
+    """
+    Find a curve using exact matches first,
+    followed by keyword matching.
+    """
+
+    columns = list(df.columns)
+
+    # Exact match.
+    for keyword in keywords:
+
+        for column in columns:
+
+            if str(column).upper().strip() == keyword:
+
+                return column
+
+    # Keyword match.
+    for column in columns:
+
+        column_upper = str(
+            column
+        ).upper()
+
+        for keyword in keywords:
 
             if keyword in column_upper:
 
@@ -284,31 +413,87 @@ def find_resistivity_curve(df):
 
 
 # ============================================================
-# 13. VSH CALCULATION
+# 14. SPECIFIC CURVE DETECTION
+# ============================================================
+
+def find_gamma_ray_curve(df):
+    return find_curve(
+        df,
+        GR_KEYWORDS
+    )
+
+
+def find_density_curve(df):
+    return find_curve(
+        df,
+        RHOB_KEYWORDS
+    )
+
+
+def find_neutron_curve(df):
+    return find_curve(
+        df,
+        NPHI_KEYWORDS
+    )
+
+
+def find_resistivity_curve(df):
+    """
+    Automatically identify a resistivity curve.
+    """
+
+    return find_curve(
+        df,
+        RESISTIVITY_KEYWORDS
+    )
+
+
+# ============================================================
+# 15. VSH CALCULATION
 # ============================================================
 
 def calculate_vsh(
     df,
-    gr_column="GR"
+    gr_column=None
 ):
     """
     Calculate normalized Gamma Ray derived VSH.
     """
 
-    if gr_column not in df.columns:
+    if gr_column is None:
+
+        gr_column = find_gamma_ray_curve(
+            df
+        )
+
+    if gr_column is None:
+
+        df["VSH"] = np.nan
 
         return df, 0.0
 
-    gr_min = df[gr_column].min()
+    gr = pd.to_numeric(
+        df[gr_column],
+        errors="coerce"
+    )
 
-    gr_max = df[gr_column].max()
+    gr_min = gr.min()
+    gr_max = gr.max()
+
+    if pd.isna(gr_min) or pd.isna(gr_max):
+
+        df["VSH"] = np.nan
+
+        return df, 0.0
 
     if gr_max == gr_min:
+
+        df["VSH"] = 0.0
 
         return df, 0.0
 
     df["VSH"] = (
-        (df[gr_column] - gr_min)
+        (gr - gr_min)
         /
         (gr_max - gr_min)
     )
@@ -326,7 +511,7 @@ def calculate_vsh(
 
 
 # ============================================================
-# 14. RESERVOIR FLAG
+# 16. RESERVOIR FLAG
 # ============================================================
 
 def calculate_reservoir_flag(
@@ -353,25 +538,34 @@ def calculate_reservoir_flag(
 
 
 # ============================================================
-# 15. NET-TO-GROSS
+# 17. NET-TO-GROSS
 # ============================================================
 
 def calculate_ntg(df):
     """
-    Calculate Net-to-Gross.
+    Calculate Net-to-Gross from valid reservoir flags.
     """
 
     if "RES_FLAG" not in df.columns:
 
         return 0.0
 
+    valid_flags = pd.to_numeric(
+        df["RES_FLAG"],
+        errors="coerce"
+    ).dropna()
+
+    if valid_flags.empty:
+
+        return 0.0
+
     return float(
-        df["RES_FLAG"].mean()
+        valid_flags.mean()
     )
 
 
 # ============================================================
-# 16. MIN-MAX DECIMATION
+# 18. MIN-MAX DECIMATION
 # ============================================================
 
 def min_max_decimate(
@@ -385,68 +579,110 @@ def min_max_decimate(
     local minimum and maximum values.
     """
 
-    if len(df) <= max_points:
+    if x_column not in df.columns:
 
         return df.copy()
+
+    if depth_column not in df.columns:
+
+        return df.copy()
+
+    work_df = df[
+        [
+            depth_column,
+            x_column
+        ]
+    ].copy()
+
+    work_df[x_column] = pd.to_numeric(
+        work_df[x_column],
+        errors="coerce"
+    )
+
+    work_df[depth_column] = pd.to_numeric(
+        work_df[depth_column],
+        errors="coerce"
+    )
+
+    work_df = work_df.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    work_df = work_df.dropna(
+        subset=[
+            depth_column,
+            x_column
+        ]
+    )
+
+    if work_df.empty:
+
+        return work_df
+
+    if len(work_df) <= max_points:
+
+        return work_df.sort_values(
+            depth_column
+        )
 
     bucket_count = max(
         1,
         max_points // 2
     )
 
-    indices = np.linspace(
+    boundaries = np.linspace(
         0,
-        len(df) - 1,
-        bucket_count
+        len(work_df),
+        bucket_count + 1
     ).astype(int)
 
-    selected_indices = set()
+    selected_positions = set()
 
     for i in range(
-        len(indices) - 1
+        len(boundaries) - 1
     ):
 
-        start = indices[i]
+        start = boundaries[i]
+        end = boundaries[i + 1]
 
-        end = indices[i + 1]
+        if end <= start:
+            continue
 
-        section = df.iloc[
-            start:end + 1
+        section = work_df.iloc[
+            start:end
         ]
 
         if section.empty:
-
             continue
 
-        min_index = section[
+        min_position = section[
             x_column
         ].idxmin()
 
-        max_index = section[
+        max_position = section[
             x_column
         ].idxmax()
 
-        selected_indices.add(
-            min_index
+        selected_positions.add(
+            min_position
         )
 
-        selected_indices.add(
-            max_index
+        selected_positions.add(
+            max_position
         )
 
-    selected_indices = sorted(
-        selected_indices
-    )
+    result = work_df.loc[
+        sorted(selected_positions)
+    ]
 
-    return df.loc[
-        selected_indices
-    ].sort_values(
+    return result.sort_values(
         depth_column
     )
 
 
 # ============================================================
-# 17. VISUAL DATA PREPARATION
+# 19. PREPARE VISUAL DATA
 # ============================================================
 
 def prepare_visual_data(
@@ -455,15 +691,25 @@ def prepare_visual_data(
     curve_columns
 ):
     """
-    Prepare decimated datasets for Plotly.
+    Prepare a clean dataset for Plotly.
     """
+
+    valid_columns = [
+        column
+        for column in curve_columns
+        if column in df.columns
+    ]
+
+    if not valid_columns:
+
+        return pd.DataFrame()
 
     visual_df = df[
         [
             depth_column
         ]
         +
-        curve_columns
+        valid_columns
     ].copy()
 
     visual_df = visual_df.replace(
@@ -471,16 +717,29 @@ def prepare_visual_data(
         np.nan
     )
 
+    visual_df[depth_column] = pd.to_numeric(
+        visual_df[depth_column],
+        errors="coerce"
+    )
+
+    for column in valid_columns:
+
+        visual_df[column] = pd.to_numeric(
+            visual_df[column],
+            errors="coerce"
+        )
+
     visual_df = visual_df.dropna(
-        subset=curve_columns,
-        how="all"
+        subset=[
+            depth_column
+        ]
     )
 
     return visual_df
 
 
 # ============================================================
-# 18. INTERACTIVE PETREL-STYLE WELL LOG CANVAS
+# 20. INTERACTIVE PETREL-STYLE WELL LOG CANVAS
 # ============================================================
 
 @st.fragment
@@ -489,7 +748,10 @@ def render_well_log_canvas(
     depth_column,
     gr_cutoff,
     vsh_cutoff,
-    resistivity_curve
+    resistivity_curve,
+    gr_curve=None,
+    rhob_curve=None,
+    nphi_curve=None
 ):
     """
     Render the main interactive multi-track
@@ -512,74 +774,81 @@ def render_well_log_canvas(
     )
 
     # --------------------------------------------------------
-    # DEPTH
-    # --------------------------------------------------------
-
-    depth = df[
-        depth_column
-    ]
-
-    # --------------------------------------------------------
     # TRACK 1 — GAMMA RAY
     # --------------------------------------------------------
 
-    if "GR" in df.columns:
+    if gr_curve is not None:
 
         gr_df = min_max_decimate(
             df,
-            "GR",
+            gr_curve,
             depth_column
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=gr_df["GR"],
-                y=gr_df[depth_column],
-                mode="lines",
-                name="GR",
-                line=dict(
-                    color="#2ca02c",
-                    width=1.5
+        if not gr_df.empty:
+
+            fig.add_trace(
+                go.Scatter(
+                    x=gr_df[gr_curve],
+                    y=gr_df[depth_column],
+                    mode="lines",
+                    name="GR",
+                    line=dict(
+                        color="#2ca02c",
+                        width=1.5
+                    ),
+                    hovertemplate=(
+                        "Depth: %{y:.2f}<br>"
+                        "GR: %{x:.2f}"
+                        "<extra></extra>"
+                    )
                 ),
-                hovertemplate=(
-                    "Depth: %{y}<br>"
-                    "GR: %{x:.2f}<extra></extra>"
-                )
-            ),
-            row=1,
-            col=1
-        )
+                row=1,
+                col=1
+            )
 
-        fig.add_vline(
-            x=gr_cutoff,
-            line_width=1.5,
-            line_dash="dash",
-            line_color="#ff4b4b",
-            row=1,
-            col=1
-        )
+            fig.add_vline(
+                x=gr_cutoff,
+                line_width=1.5,
+                line_dash="dash",
+                line_color="#ff4b4b",
+                row=1,
+                col=1
+            )
 
-        # ----------------------------------------------------
-        # GR CLEAN-SAND SHADING
-        # ----------------------------------------------------
+            # ------------------------------------------------
+            # CLEAN-SAND VISUAL INDICATOR
+            # ------------------------------------------------
+            #
+            # Use a separate masked curve so only values
+            # below the GR cutoff are visually emphasized.
+            # ------------------------------------------------
 
-        fig.add_trace(
-            go.Scatter(
-                x=gr_df["GR"],
-                y=gr_df[depth_column],
-                mode="lines",
-                line=dict(
-                    width=0
+            clean_sand_df = gr_df.copy()
+
+            clean_sand_df.loc[
+                clean_sand_df[gr_curve] >= gr_cutoff,
+                gr_curve
+            ] = np.nan
+
+            fig.add_trace(
+                go.Scatter(
+                    x=clean_sand_df[gr_curve],
+                    y=clean_sand_df[depth_column],
+                    mode="lines",
+                    line=dict(
+                        color="rgba(0,0,0,0)"
+                    ),
+                    fill="tozerox",
+                    fillcolor="rgba(255,193,7,0.18)",
+                    name="Low GR",
+                    hoverinfo="skip",
+                    showlegend=False,
+                    connectgaps=False
                 ),
-                fill="tozerox",
-                fillcolor="rgba(255, 193, 7, 0.18)",
-                name="Low GR",
-                hoverinfo="skip",
-                showlegend=False
-            ),
-            row=1,
-            col=1
-        )
+                row=1,
+                col=1
+            )
 
     # --------------------------------------------------------
     # TRACK 2 — RESISTIVITY
@@ -593,105 +862,113 @@ def render_well_log_canvas(
             depth_column
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=res_df[
-                    resistivity_curve
-                ],
-                y=res_df[
-                    depth_column
-                ],
-                mode="lines",
-                name=str(
-                    resistivity_curve
-                ),
-                line=dict(
-                    color="#d62728",
-                    width=1.5
-                ),
-                hovertemplate=(
-                    "Depth: %{y}<br>"
-                    "Resistivity: %{x:.3f}"
-                    "<extra></extra>"
-                )
-            ),
-            row=1,
-            col=2
-        )
+        if not res_df.empty:
 
-        fig.update_xaxes(
-            type="log",
-            row=1,
-            col=2
-        )
+            positive_res = res_df[
+                res_df[resistivity_curve] > 0
+            ]
+
+            if not positive_res.empty:
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=positive_res[
+                            resistivity_curve
+                        ],
+                        y=positive_res[
+                            depth_column
+                        ],
+                        mode="lines",
+                        name=str(
+                            resistivity_curve
+                        ),
+                        line=dict(
+                            color="#d62728",
+                            width=1.5
+                        ),
+                        hovertemplate=(
+                            "Depth: %{y:.2f}<br>"
+                            "Resistivity: %{x:.3f}"
+                            "<extra></extra>"
+                        )
+                    ),
+                    row=1,
+                    col=2
+                )
+
+                fig.update_xaxes(
+                    type="log",
+                    row=1,
+                    col=2
+                )
 
     # --------------------------------------------------------
     # TRACK 3 — DENSITY
     # --------------------------------------------------------
 
-    if "RHOB" in df.columns:
+    if rhob_curve is not None:
 
         rhob_df = min_max_decimate(
             df,
-            "RHOB",
+            rhob_curve,
             depth_column
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=rhob_df["RHOB"],
-                y=rhob_df[
-                    depth_column
-                ],
-                mode="lines",
-                name="RHOB",
-                line=dict(
-                    color="#1f77b4",
-                    width=1.5
+        if not rhob_df.empty:
+
+            fig.add_trace(
+                go.Scatter(
+                    x=rhob_df[rhob_curve],
+                    y=rhob_df[depth_column],
+                    mode="lines",
+                    name="RHOB",
+                    line=dict(
+                        color="#1f77b4",
+                        width=1.5
+                    ),
+                    hovertemplate=(
+                        "Depth: %{y:.2f}<br>"
+                        "RHOB: %{x:.3f}"
+                        "<extra></extra>"
+                    )
                 ),
-                hovertemplate=(
-                    "Depth: %{y}<br>"
-                    "RHOB: %{x:.3f}"
-                    "<extra></extra>"
-                )
-            ),
-            row=1,
-            col=3
-        )
+                row=1,
+                col=3
+            )
 
     # --------------------------------------------------------
-    # NPHI
+    # TRACK 3 — NPHI
     # --------------------------------------------------------
 
-    if "NPHI" in df.columns:
+    if nphi_curve is not None:
 
         nphi_df = min_max_decimate(
             df,
-            "NPHI",
+            nphi_curve,
             depth_column
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=nphi_df["NPHI"],
-                y=nphi_df[
-                    depth_column
-                ],
-                mode="lines",
-                name="NPHI",
-                line=dict(
-                    color="#9467bd",
-                    width=1.5
+        if not nphi_df.empty:
+
+            fig.add_trace(
+                go.Scatter(
+                    x=nphi_df[nphi_curve],
+                    y=nphi_df[depth_column],
+                    mode="lines",
+                    name="NPHI",
+                    line=dict(
+                        color="#9467bd",
+                        width=1.5
+                    ),
+                    hovertemplate=(
+                        "Depth: %{y:.2f}<br>"
+                        "NPHI: %{x:.3f}"
+                        "<extra></extra>"
+                    )
                 ),
-                hovertemplate=(
-                    "Depth: %{y}<br>"
-                    "NPHI: %{x:.3f}"
-                    "<extra></extra>"
-                )
-            ),
-            row=1,
-            col=3
-        )
+                row=1,
+                col=3
+            )
 
     # --------------------------------------------------------
     # TRACK 4 — VSH
@@ -705,36 +982,36 @@ def render_well_log_canvas(
             depth_column
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=vsh_df["VSH"],
-                y=vsh_df[
-                    depth_column
-                ],
-                mode="lines",
-                name="VSH",
-                line=dict(
-                    color="#111111",
-                    width=1.5
-                ),
-                hovertemplate=(
-                    "Depth: %{y}<br>"
-                    "VSH: %{x:.3f}"
-                    "<extra></extra>"
-                )
-            ),
-            row=1,
-            col=4
-        )
+        if not vsh_df.empty:
 
-        fig.add_vline(
-            x=vsh_cutoff,
-            line_width=1.5,
-            line_dash="dash",
-            line_color="#ff4b4b",
-            row=1,
-            col=4
-        )
+            fig.add_trace(
+                go.Scatter(
+                    x=vsh_df["VSH"],
+                    y=vsh_df[depth_column],
+                    mode="lines",
+                    name="VSH",
+                    line=dict(
+                        color="#111111",
+                        width=1.5
+                    ),
+                    hovertemplate=(
+                        "Depth: %{y:.2f}<br>"
+                        "VSH: %{x:.3f}"
+                        "<extra></extra>"
+                    )
+                ),
+                row=1,
+                col=4
+            )
+
+            fig.add_vline(
+                x=vsh_cutoff,
+                line_width=1.5,
+                line_dash="dash",
+                line_color="#ff4b4b",
+                row=1,
+                col=4
+            )
 
     # --------------------------------------------------------
     # SHARED DEPTH AXIS
@@ -830,11 +1107,14 @@ def render_well_log_canvas(
 
 
 # ============================================================
-# 19. AI LITHOLOGY MODEL
+# 21. AI LITHOLOGY MODEL
 # ============================================================
 
 def run_ai_lithology(
     df,
+    gr_curve,
+    rhob_curve,
+    nphi_curve,
     gr_cutoff
 ):
     """
@@ -842,31 +1122,46 @@ def run_ai_lithology(
     lithology prototype.
     """
 
-    required_curves = [
+    if gr_curve is None:
+
+        return None, None, (
+            "Gamma Ray curve is required for the AI prototype."
+        )
+
+    if rhob_curve is None:
+
+        return None, None, (
+            "Density curve is required for the AI prototype."
+        )
+
+    if nphi_curve is None:
+
+        return None, None, (
+            "Neutron porosity curve is required for the AI prototype."
+        )
+
+    ai_df = df[
+        [
+            gr_curve,
+            rhob_curve,
+            nphi_curve
+        ]
+    ].copy()
+
+    ai_df.columns = [
         "GR",
         "RHOB",
         "NPHI"
     ]
 
-    missing = [
-        curve
-        for curve in required_curves
-        if curve not in df.columns
-    ]
-
-    if missing:
-
-        return None, None, (
-            f"Missing curves: {', '.join(missing)}"
-        )
-
-    ai_df = df[
-        required_curves
-    ].copy()
-
     ai_df = ai_df.replace(
         [np.inf, -np.inf],
         np.nan
+    )
+
+    ai_df = ai_df.apply(
+        pd.to_numeric,
+        errors="coerce"
     )
 
     ai_df = ai_df.dropna()
@@ -941,11 +1236,14 @@ def run_ai_lithology(
 
 
 # ============================================================
-# 20. AI LITHOLOGY DISPLAY
+# 22. AI LITHOLOGY DISPLAY
 # ============================================================
 
 def display_ai_lithology(
     df,
+    gr_curve,
+    rhob_curve,
+    nphi_curve,
     gr_cutoff
 ):
     """
@@ -958,6 +1256,9 @@ def display_ai_lithology(
 
     result = run_ai_lithology(
         df,
+        gr_curve,
+        rhob_curve,
+        nphi_curve,
         gr_cutoff
     )
 
@@ -1012,7 +1313,7 @@ def display_ai_lithology(
 
 
 # ============================================================
-# 21. MULTI-WELL ANALYSIS
+# 23. MULTI-WELL ANALYSIS
 # ============================================================
 
 def display_multi_well_analysis():
@@ -1034,8 +1335,13 @@ def display_multi_well_analysis():
 
         return
 
+    # Ensure database dataframe is Arrow-safe.
+    display_wells = make_arrow_safe_dataframe(
+        wells
+    )
+
     st.dataframe(
-        wells,
+        display_wells,
         width="stretch",
         hide_index=True
     )
@@ -1052,8 +1358,11 @@ def display_multi_well_analysis():
 
         ntg_fig.add_trace(
             go.Bar(
-                x=wells["well_name"],
-                y=wells["net_to_gross"]
+                x=wells["well_name"].astype(str),
+                y=pd.to_numeric(
+                    wells["net_to_gross"],
+                    errors="coerce"
+                )
             )
         )
 
@@ -1074,8 +1383,11 @@ def display_multi_well_analysis():
 
         vsh_fig.add_trace(
             go.Bar(
-                x=wells["well_name"],
-                y=wells["average_vsh"]
+                x=wells["well_name"].astype(str),
+                y=pd.to_numeric(
+                    wells["average_vsh"],
+                    errors="coerce"
+                )
             )
         )
 
@@ -1092,14 +1404,14 @@ def display_multi_well_analysis():
 
 
 # ============================================================
-# 22. APPLICATION INITIALIZATION
+# 24. APPLICATION INITIALIZATION
 # ============================================================
 
 initialize_database()
 
 
 # ============================================================
-# 23. APPLICATION HEADER
+# 25. APPLICATION HEADER
 # ============================================================
 
 st.title(
@@ -1114,7 +1426,7 @@ st.divider()
 
 
 # ============================================================
-# 24. SIDEBAR CONTROLS
+# 26. SIDEBAR CONTROLS
 # ============================================================
 
 st.sidebar.header(
@@ -1138,7 +1450,7 @@ vsh_cutoff = st.sidebar.slider(
 
 
 # ============================================================
-# 25. LAS FILE UPLOAD
+# 27. LAS FILE UPLOAD
 # ============================================================
 
 uploaded_file = st.file_uploader(
@@ -1148,7 +1460,7 @@ uploaded_file = st.file_uploader(
 
 
 # ============================================================
-# 26. MAIN APPLICATION WORKFLOW
+# 28. MAIN APPLICATION WORKFLOW
 # ============================================================
 
 if uploaded_file is not None:
@@ -1203,6 +1515,14 @@ if uploaded_file is not None:
             las
         )
 
+        if df.empty:
+
+            st.error(
+                "The LAS file contains no usable log samples."
+            )
+
+            st.stop()
+
         depth_column = get_depth_column(
             df
         )
@@ -1215,8 +1535,39 @@ if uploaded_file is not None:
             "📋 Available Curves"
         )
 
-        st.write(
-            list(df.columns)
+        curve_list_df = pd.DataFrame(
+            {
+                "Curve": [
+                    str(column)
+                    for column in df.columns
+                ]
+            }
+        )
+
+        st.dataframe(
+            curve_list_df,
+            width="stretch",
+            hide_index=True
+        )
+
+        # ----------------------------------------------------
+        # CURVE DETECTION
+        # ----------------------------------------------------
+
+        gr_curve = find_gamma_ray_curve(
+            df
+        )
+
+        rhob_curve = find_density_curve(
+            df
+        )
+
+        nphi_curve = find_neutron_curve(
+            df
+        )
+
+        resistivity_curve = find_resistivity_curve(
+            df
         )
 
         # ----------------------------------------------------
@@ -1227,9 +1578,14 @@ if uploaded_file is not None:
             "View LAS Data Preview"
         ):
 
+            preview_df = make_arrow_safe_dataframe(
+                df.head(20)
+            )
+
             st.dataframe(
-                df.head(20),
-                width="stretch"
+                preview_df,
+                width="stretch",
+                hide_index=True
             )
 
         # ----------------------------------------------------
@@ -1237,7 +1593,8 @@ if uploaded_file is not None:
         # ----------------------------------------------------
 
         df, average_vsh = calculate_vsh(
-            df
+            df,
+            gr_curve
         )
 
         df = calculate_reservoir_flag(
@@ -1281,25 +1638,71 @@ if uploaded_file is not None:
             )
 
         # ----------------------------------------------------
-        # RESISTIVITY DETECTION
+        # CURVE STATUS
         # ----------------------------------------------------
 
-        resistivity_curve = find_resistivity_curve(
-            df
+        st.subheader(
+            "🔎 Curve Detection"
+
         )
 
-        if resistivity_curve:
+        status_col1, status_col2, status_col3, status_col4 = st.columns(4)
 
-            st.success(
-                f"Resistivity detected: "
-                f"{resistivity_curve}"
-            )
+        with status_col1:
 
-        else:
+            if gr_curve:
 
-            st.warning(
-                "No resistivity curve detected."
-            )
+                st.success(
+                    f"GR: {gr_curve}"
+                )
+
+            else:
+
+                st.warning(
+                    "GR not found"
+                )
+
+        with status_col2:
+
+            if resistivity_curve:
+
+                st.success(
+                    f"RES: {resistivity_curve}"
+                )
+
+            else:
+
+                st.warning(
+                    "RES not found"
+                )
+
+        with status_col3:
+
+            if rhob_curve:
+
+                st.success(
+                    f"RHOB: {rhob_curve}"
+                )
+
+            else:
+
+                st.warning(
+                    "RHOB not found"
+                )
+
+        with status_col4:
+
+            if nphi_curve:
+
+                st.success(
+                    f"NPHI: {nphi_curve}"
+                )
+
+            else:
+
+                st.warning(
+                    "NPHI not found"
+                )
 
         # ----------------------------------------------------
         # INTERACTIVE CANVAS
@@ -1314,7 +1717,10 @@ if uploaded_file is not None:
             depth_column=depth_column,
             gr_cutoff=gr_cutoff,
             vsh_cutoff=vsh_cutoff,
-            resistivity_curve=resistivity_curve
+            resistivity_curve=resistivity_curve,
+            gr_curve=gr_curve,
+            rhob_curve=rhob_curve,
+            nphi_curve=nphi_curve
         )
 
         # ----------------------------------------------------
@@ -1337,21 +1743,22 @@ if uploaded_file is not None:
                     "Net-to-Gross"
                 ],
                 "Value": [
-                    well_name,
-                    company,
-                    len(df),
-                    gr_cutoff,
-                    vsh_cutoff,
-                    round(
-                        average_vsh,
-                        3
-                    ),
-                    round(
-                        ntg,
-                        3
-                    )
+                    str(well_name),
+                    str(company),
+                    str(len(df)),
+                    str(gr_cutoff),
+                    str(vsh_cutoff),
+                    str(round(average_vsh, 3)),
+                    str(round(ntg, 3))
                 ]
             }
+        )
+
+        # IMPORTANT:
+        # Value is explicitly converted to string.
+        # This prevents the PyArrow mixed-type error.
+        summary_df = make_arrow_safe_dataframe(
+            summary_df
         )
 
         st.dataframe(
@@ -1392,8 +1799,11 @@ if uploaded_file is not None:
         st.divider()
 
         display_ai_lithology(
-            df,
-            gr_cutoff
+            df=df,
+            gr_curve=gr_curve,
+            rhob_curve=rhob_curve,
+            nphi_curve=nphi_curve,
+            gr_cutoff=gr_cutoff
         )
 
         # ----------------------------------------------------
@@ -1417,7 +1827,7 @@ if uploaded_file is not None:
 
 
 # ============================================================
-# 27. EMPTY STATE
+# 29. EMPTY STATE
 # ============================================================
 
 else:
