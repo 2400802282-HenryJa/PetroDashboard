@@ -1,41 +1,87 @@
+# ============================================================
+# PETRODASHBOARD
+# Interactive Petroleum Engineering & Well Log Platform
+# ============================================================
+
+
+# ============================================================
+# 1. IMPORTS
+# ============================================================
+
 import sqlite3
 from io import StringIO
 from pathlib import Path
 
 import lasio
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
 from plotly.subplots import make_subplots
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# 2. PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="Petroleum Engineering Dashboard",
+    page_title="PetroDashboard",
     page_icon="🛢️",
     layout="wide"
 )
 
 
 # ============================================================
-# DATABASE CONFIGURATION
+# 3. APPLICATION CONSTANTS
+# ============================================================
+
+APP_TITLE = "🛢️ PetroDashboard"
+
+APP_SUBTITLE = (
+    "Interactive Petroleum Engineering, "
+    "Well Log & Formation Evaluation Platform"
+)
+
+DATABASE_FILE = "petroleum_dashboard.db"
+
+MAX_VISUAL_POINTS = 4000
+
+RESISTIVITY_KEYWORDS = [
+    "RT",
+    "RES",
+    "ILD",
+    "LLD",
+    "RDEP",
+    "AT90",
+    "RESD",
+    "LLS",
+    "MSFL",
+    "RXO",
+    "RILD"
+]
+
+
+# ============================================================
+# 4. DATABASE PATH
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "petroleum_dashboard.db"
 
+DB_PATH = BASE_DIR / DATABASE_FILE
+
+
+# ============================================================
+# 5. DATABASE INITIALIZATION
+# ============================================================
 
 def initialize_database():
     """
-    Create the SQLite database and wells table if they do not exist.
+    Create the SQLite database and required tables.
     """
 
     conn = sqlite3.connect(DB_PATH)
@@ -56,10 +102,15 @@ def initialize_database():
     )
 
     conn.commit()
+
     conn.close()
 
 
-def save_well_to_database(
+# ============================================================
+# 6. DATABASE SAVE FUNCTION
+# ============================================================
+
+def save_well_analysis(
     well_name,
     company,
     depth_samples,
@@ -67,7 +118,7 @@ def save_well_to_database(
     net_to_gross
 ):
     """
-    Save formation evaluation results to SQLite.
+    Save well formation evaluation results.
     """
 
     conn = sqlite3.connect(DB_PATH)
@@ -95,52 +146,979 @@ def save_well_to_database(
     )
 
     conn.commit()
+
     conn.close()
 
 
+# ============================================================
+# 7. LOAD SAVED WELLS
+# ============================================================
+
 def load_saved_wells():
     """
-    Load saved wells from the SQLite database.
+    Retrieve saved well analysis records.
     """
 
     conn = sqlite3.connect(DB_PATH)
 
-    df_wells = pd.read_sql_query(
+    wells = pd.read_sql_query(
         "SELECT * FROM wells",
         conn
     )
 
     conn.close()
 
-    return df_wells
+    return wells
 
 
-# Initialize database
+# ============================================================
+# 8. LAS FILE LOADING
+# ============================================================
+
+def load_las_file(uploaded_file):
+    """
+    Convert uploaded LAS file into a lasio object.
+    """
+
+    las_string = uploaded_file.getvalue().decode(
+        "utf-8",
+        errors="ignore"
+    )
+
+    las_stream = StringIO(
+        las_string
+    )
+
+    las = lasio.read(
+        las_stream,
+        engine="normal"
+    )
+
+    return las
+
+
+# ============================================================
+# 9. LAS → DATAFRAME
+# ============================================================
+
+def las_to_dataframe(las):
+    """
+    Convert LAS data into a Pandas DataFrame.
+    """
+
+    df = las.df()
+
+    df.reset_index(
+        inplace=True
+    )
+
+    return df
+
+
+# ============================================================
+# 10. WELL INFORMATION EXTRACTION
+# ============================================================
+
+def get_well_information(las):
+    """
+    Extract basic well metadata.
+    """
+
+    if "WELL" in las.well:
+
+        well_name = str(
+            las.well.WELL.value
+        )
+
+    else:
+
+        well_name = "Unknown"
+
+    if "COMP" in las.well:
+
+        company = str(
+            las.well.COMP.value
+        )
+
+    else:
+
+        company = "Unknown"
+
+    return well_name, company
+
+
+# ============================================================
+# 11. DEPTH COLUMN DETECTION
+# ============================================================
+
+def get_depth_column(df):
+    """
+    Identify the depth/index column.
+    """
+
+    return df.columns[0]
+
+
+# ============================================================
+# 12. RESISTIVITY CURVE DETECTION
+# ============================================================
+
+def find_resistivity_curve(df):
+    """
+    Automatically identify a resistivity curve.
+    """
+
+    for column in df.columns:
+
+        column_upper = str(
+            column
+        ).upper()
+
+        for keyword in RESISTIVITY_KEYWORDS:
+
+            if keyword in column_upper:
+
+                return column
+
+    return None
+
+
+# ============================================================
+# 13. VSH CALCULATION
+# ============================================================
+
+def calculate_vsh(
+    df,
+    gr_column="GR"
+):
+    """
+    Calculate normalized Gamma Ray derived VSH.
+    """
+
+    if gr_column not in df.columns:
+
+        return df, 0.0
+
+    gr_min = df[gr_column].min()
+
+    gr_max = df[gr_column].max()
+
+    if gr_max == gr_min:
+
+        return df, 0.0
+
+    df["VSH"] = (
+        (df[gr_column] - gr_min)
+        /
+        (gr_max - gr_min)
+    )
+
+    df["VSH"] = df["VSH"].clip(
+        0,
+        1
+    )
+
+    average_vsh = float(
+        df["VSH"].mean()
+    )
+
+    return df, average_vsh
+
+
+# ============================================================
+# 14. RESERVOIR FLAG
+# ============================================================
+
+def calculate_reservoir_flag(
+    df,
+    vsh_cutoff
+):
+    """
+    Identify reservoir intervals using VSH cutoff.
+    """
+
+    if "VSH" not in df.columns:
+
+        df["RES_FLAG"] = 0
+
+        return df
+
+    df["RES_FLAG"] = np.where(
+        df["VSH"] < vsh_cutoff,
+        1,
+        0
+    )
+
+    return df
+
+
+# ============================================================
+# 15. NET-TO-GROSS
+# ============================================================
+
+def calculate_ntg(df):
+    """
+    Calculate Net-to-Gross.
+    """
+
+    if "RES_FLAG" not in df.columns:
+
+        return 0.0
+
+    return float(
+        df["RES_FLAG"].mean()
+    )
+
+
+# ============================================================
+# 16. MIN-MAX DECIMATION
+# ============================================================
+
+def min_max_decimate(
+    df,
+    x_column,
+    depth_column,
+    max_points=MAX_VISUAL_POINTS
+):
+    """
+    Reduce visualization points while preserving
+    local minimum and maximum values.
+    """
+
+    if len(df) <= max_points:
+
+        return df.copy()
+
+    bucket_count = max(
+        1,
+        max_points // 2
+    )
+
+    indices = np.linspace(
+        0,
+        len(df) - 1,
+        bucket_count
+    ).astype(int)
+
+    selected_indices = set()
+
+    for i in range(
+        len(indices) - 1
+    ):
+
+        start = indices[i]
+
+        end = indices[i + 1]
+
+        section = df.iloc[
+            start:end + 1
+        ]
+
+        if section.empty:
+
+            continue
+
+        min_index = section[
+            x_column
+        ].idxmin()
+
+        max_index = section[
+            x_column
+        ].idxmax()
+
+        selected_indices.add(
+            min_index
+        )
+
+        selected_indices.add(
+            max_index
+        )
+
+    selected_indices = sorted(
+        selected_indices
+    )
+
+    return df.loc[
+        selected_indices
+    ].sort_values(
+        depth_column
+    )
+
+
+# ============================================================
+# 17. VISUAL DATA PREPARATION
+# ============================================================
+
+def prepare_visual_data(
+    df,
+    depth_column,
+    curve_columns
+):
+    """
+    Prepare decimated datasets for Plotly.
+    """
+
+    visual_df = df[
+        [
+            depth_column
+        ]
+        +
+        curve_columns
+    ].copy()
+
+    visual_df = visual_df.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    visual_df = visual_df.dropna(
+        subset=curve_columns,
+        how="all"
+    )
+
+    return visual_df
+
+
+# ============================================================
+# 18. INTERACTIVE PETREL-STYLE WELL LOG CANVAS
+# ============================================================
+
+@st.fragment
+def render_well_log_canvas(
+    df,
+    depth_column,
+    gr_cutoff,
+    vsh_cutoff,
+    resistivity_curve
+):
+    """
+    Render the main interactive multi-track
+    Petrel-style well log canvas.
+    """
+
+    track_count = 4
+
+    fig = make_subplots(
+        rows=1,
+        cols=track_count,
+        shared_yaxes=True,
+        horizontal_spacing=0.015,
+        subplot_titles=(
+            "Gamma Ray",
+            "Resistivity",
+            "Density / Porosity",
+            "VSH"
+        )
+    )
+
+    # --------------------------------------------------------
+    # DEPTH
+    # --------------------------------------------------------
+
+    depth = df[
+        depth_column
+    ]
+
+    # --------------------------------------------------------
+    # TRACK 1 — GAMMA RAY
+    # --------------------------------------------------------
+
+    if "GR" in df.columns:
+
+        gr_df = min_max_decimate(
+            df,
+            "GR",
+            depth_column
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=gr_df["GR"],
+                y=gr_df[depth_column],
+                mode="lines",
+                name="GR",
+                line=dict(
+                    color="#2ca02c",
+                    width=1.5
+                ),
+                hovertemplate=(
+                    "Depth: %{y}<br>"
+                    "GR: %{x:.2f}<extra></extra>"
+                )
+            ),
+            row=1,
+            col=1
+        )
+
+        fig.add_vline(
+            x=gr_cutoff,
+            line_width=1.5,
+            line_dash="dash",
+            line_color="#ff4b4b",
+            row=1,
+            col=1
+        )
+
+        # ----------------------------------------------------
+        # GR CLEAN-SAND SHADING
+        # ----------------------------------------------------
+
+        fig.add_trace(
+            go.Scatter(
+                x=gr_df["GR"],
+                y=gr_df[depth_column],
+                mode="lines",
+                line=dict(
+                    width=0
+                ),
+                fill="tozerox",
+                fillcolor="rgba(255, 193, 7, 0.18)",
+                name="Low GR",
+                hoverinfo="skip",
+                showlegend=False
+            ),
+            row=1,
+            col=1
+        )
+
+    # --------------------------------------------------------
+    # TRACK 2 — RESISTIVITY
+    # --------------------------------------------------------
+
+    if resistivity_curve is not None:
+
+        res_df = min_max_decimate(
+            df,
+            resistivity_curve,
+            depth_column
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=res_df[
+                    resistivity_curve
+                ],
+                y=res_df[
+                    depth_column
+                ],
+                mode="lines",
+                name=str(
+                    resistivity_curve
+                ),
+                line=dict(
+                    color="#d62728",
+                    width=1.5
+                ),
+                hovertemplate=(
+                    "Depth: %{y}<br>"
+                    "Resistivity: %{x:.3f}"
+                    "<extra></extra>"
+                )
+            ),
+            row=1,
+            col=2
+        )
+
+        fig.update_xaxes(
+            type="log",
+            row=1,
+            col=2
+        )
+
+    # --------------------------------------------------------
+    # TRACK 3 — DENSITY
+    # --------------------------------------------------------
+
+    if "RHOB" in df.columns:
+
+        rhob_df = min_max_decimate(
+            df,
+            "RHOB",
+            depth_column
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=rhob_df["RHOB"],
+                y=rhob_df[
+                    depth_column
+                ],
+                mode="lines",
+                name="RHOB",
+                line=dict(
+                    color="#1f77b4",
+                    width=1.5
+                ),
+                hovertemplate=(
+                    "Depth: %{y}<br>"
+                    "RHOB: %{x:.3f}"
+                    "<extra></extra>"
+                )
+            ),
+            row=1,
+            col=3
+        )
+
+    # --------------------------------------------------------
+    # NPHI
+    # --------------------------------------------------------
+
+    if "NPHI" in df.columns:
+
+        nphi_df = min_max_decimate(
+            df,
+            "NPHI",
+            depth_column
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=nphi_df["NPHI"],
+                y=nphi_df[
+                    depth_column
+                ],
+                mode="lines",
+                name="NPHI",
+                line=dict(
+                    color="#9467bd",
+                    width=1.5
+                ),
+                hovertemplate=(
+                    "Depth: %{y}<br>"
+                    "NPHI: %{x:.3f}"
+                    "<extra></extra>"
+                )
+            ),
+            row=1,
+            col=3
+        )
+
+    # --------------------------------------------------------
+    # TRACK 4 — VSH
+    # --------------------------------------------------------
+
+    if "VSH" in df.columns:
+
+        vsh_df = min_max_decimate(
+            df,
+            "VSH",
+            depth_column
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=vsh_df["VSH"],
+                y=vsh_df[
+                    depth_column
+                ],
+                mode="lines",
+                name="VSH",
+                line=dict(
+                    color="#111111",
+                    width=1.5
+                ),
+                hovertemplate=(
+                    "Depth: %{y}<br>"
+                    "VSH: %{x:.3f}"
+                    "<extra></extra>"
+                )
+            ),
+            row=1,
+            col=4
+        )
+
+        fig.add_vline(
+            x=vsh_cutoff,
+            line_width=1.5,
+            line_dash="dash",
+            line_color="#ff4b4b",
+            row=1,
+            col=4
+        )
+
+    # --------------------------------------------------------
+    # SHARED DEPTH AXIS
+    # --------------------------------------------------------
+
+    fig.update_yaxes(
+        autorange="reversed",
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikecolor="white",
+        spikethickness=1
+    )
+
+    # --------------------------------------------------------
+    # X-AXIS TITLES
+    # --------------------------------------------------------
+
+    fig.update_xaxes(
+        title_text="GR",
+        row=1,
+        col=1
+    )
+
+    fig.update_xaxes(
+        title_text="Resistivity",
+        row=1,
+        col=2
+    )
+
+    fig.update_xaxes(
+        title_text="RHOB / NPHI",
+        row=1,
+        col=3
+    )
+
+    fig.update_xaxes(
+        title_text="VSH",
+        range=[0, 1],
+        row=1,
+        col=4
+    )
+
+    # --------------------------------------------------------
+    # PETREL-STYLE INTERACTION
+    # --------------------------------------------------------
+
+    fig.update_layout(
+        template="plotly_dark",
+        hovermode="y unified",
+        height=900,
+        margin=dict(
+            l=50,
+            r=30,
+            t=60,
+            b=40
+        ),
+        dragmode="pan",
+        showlegend=False
+    )
+
+    # --------------------------------------------------------
+    # REMOVE INTERIOR DEPTH AXES
+    # --------------------------------------------------------
+
+    for column in range(
+        2,
+        track_count + 1
+    ):
+
+        fig.update_yaxes(
+            showticklabels=False,
+            row=1,
+            col=column
+        )
+
+    # --------------------------------------------------------
+    # RENDER
+    # --------------------------------------------------------
+
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        config={
+            "scrollZoom": True,
+            "displaylogo": False,
+            "modeBarButtonsToRemove": [
+                "lasso2d",
+                "select2d"
+            ]
+        }
+    )
+
+
+# ============================================================
+# 19. AI LITHOLOGY MODEL
+# ============================================================
+
+def run_ai_lithology(
+    df,
+    gr_cutoff
+):
+    """
+    Train and run the educational Random Forest
+    lithology prototype.
+    """
+
+    required_curves = [
+        "GR",
+        "RHOB",
+        "NPHI"
+    ]
+
+    missing = [
+        curve
+        for curve in required_curves
+        if curve not in df.columns
+    ]
+
+    if missing:
+
+        return None, None, (
+            f"Missing curves: {', '.join(missing)}"
+        )
+
+    ai_df = df[
+        required_curves
+    ].copy()
+
+    ai_df = ai_df.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    ai_df = ai_df.dropna()
+
+    if len(ai_df) < 20:
+
+        return None, None, (
+            "Not enough valid samples for AI training."
+        )
+
+    ai_df["Lithology"] = np.where(
+        ai_df["GR"] < gr_cutoff,
+        1,
+        0
+    )
+
+    X = ai_df[
+        [
+            "GR",
+            "RHOB",
+            "NPHI"
+        ]
+    ]
+
+    y = ai_df[
+        "Lithology"
+    ]
+
+    if y.nunique() < 2:
+
+        return None, None, (
+            "Only one lithology class exists. "
+            "Adjust the GR cutoff."
+        )
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y
+    )
+
+    model = RandomForestClassifier(
+        n_estimators=100,
+        random_state=42
+    )
+
+    model.fit(
+        X_train,
+        y_train
+    )
+
+    prediction = model.predict(
+        X_test
+    )
+
+    accuracy = accuracy_score(
+        y_test,
+        prediction
+    )
+
+    ai_df["Predicted_Lithology"] = model.predict(
+        X
+    )
+
+    return (
+        model,
+        ai_df,
+        accuracy
+    )
+
+
+# ============================================================
+# 20. AI LITHOLOGY DISPLAY
+# ============================================================
+
+def display_ai_lithology(
+    df,
+    gr_cutoff
+):
+    """
+    Display AI lithology interpretation.
+    """
+
+    st.subheader(
+        "🤖 AI Lithology Interpretation"
+    )
+
+    result = run_ai_lithology(
+        df,
+        gr_cutoff
+    )
+
+    if result[0] is None:
+
+        st.warning(
+            result[2]
+        )
+
+        return
+
+    model, ai_df, accuracy = result
+
+    st.metric(
+        "Prototype Model Accuracy",
+        f"{accuracy * 100:.2f}%"
+    )
+
+    sand_count = int(
+        (
+            ai_df["Predicted_Lithology"] == 1
+        ).sum()
+    )
+
+    shale_count = int(
+        (
+            ai_df["Predicted_Lithology"] == 0
+        ).sum()
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.metric(
+            "Predicted Sand Samples",
+            sand_count
+        )
+
+    with col2:
+
+        st.metric(
+            "Predicted Shale Samples",
+            shale_count
+        )
+
+    st.info(
+        "This is an educational AI prototype. "
+        "The training labels are generated from the GR cutoff "
+        "rather than expert-labelled core or facies data."
+    )
+
+
+# ============================================================
+# 21. MULTI-WELL ANALYSIS
+# ============================================================
+
+def display_multi_well_analysis():
+    """
+    Display saved wells and comparison charts.
+    """
+
+    st.subheader(
+        "🗄️ Well Database"
+    )
+
+    wells = load_saved_wells()
+
+    if wells.empty:
+
+        st.info(
+            "No saved wells are currently available."
+        )
+
+        return
+
+    st.dataframe(
+        wells,
+        width="stretch",
+        hide_index=True
+    )
+
+    st.subheader(
+        "📊 Multi-Well Comparison"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        ntg_fig = go.Figure()
+
+        ntg_fig.add_trace(
+            go.Bar(
+                x=wells["well_name"],
+                y=wells["net_to_gross"]
+            )
+        )
+
+        ntg_fig.update_layout(
+            title="Net-to-Gross",
+            xaxis_title="Well",
+            yaxis_title="NTG"
+        )
+
+        st.plotly_chart(
+            ntg_fig,
+            width="stretch"
+        )
+
+    with col2:
+
+        vsh_fig = go.Figure()
+
+        vsh_fig.add_trace(
+            go.Bar(
+                x=wells["well_name"],
+                y=wells["average_vsh"]
+            )
+        )
+
+        vsh_fig.update_layout(
+            title="Average VSH",
+            xaxis_title="Well",
+            yaxis_title="Average VSH"
+        )
+
+        st.plotly_chart(
+            vsh_fig,
+            width="stretch"
+        )
+
+
+# ============================================================
+# 22. APPLICATION INITIALIZATION
+# ============================================================
+
 initialize_database()
 
 
 # ============================================================
-# DASHBOARD HEADER
+# 23. APPLICATION HEADER
 # ============================================================
 
 st.title(
-    "🛢️ Petroleum Engineering Dashboard"
+    APP_TITLE
 )
 
-st.write(
-    "Interactive LAS Well Log Viewer "
-    "with Formation Evaluation and AI Lithology Prediction"
+st.caption(
+    APP_SUBTITLE
 )
 
 st.divider()
 
 
 # ============================================================
-# SIDEBAR
+# 24. SIDEBAR CONTROLS
 # ============================================================
 
 st.sidebar.header(
-    "⚙️ Formation Evaluation Settings"
+    "⚙️ Interpretation Controls"
 )
 
 gr_cutoff = st.sidebar.slider(
@@ -151,96 +1129,62 @@ gr_cutoff = st.sidebar.slider(
 )
 
 vsh_cutoff = st.sidebar.slider(
-    "Maximum VSH Reservoir Cutoff",
+    "VSH Reservoir Cutoff",
     min_value=0.0,
     max_value=1.0,
     value=0.5,
     step=0.05
 )
 
-st.sidebar.info(
-    "Upload a LAS well log file to begin the analysis."
-)
-
 
 # ============================================================
-# FILE UPLOADER
+# 25. LAS FILE UPLOAD
 # ============================================================
 
 uploaded_file = st.file_uploader(
-    "📂 Upload LAS Well Log File",
+    "📂 Upload LAS Well Log",
     type=["las"]
 )
 
 
 # ============================================================
-# MAIN APPLICATION
+# 26. MAIN APPLICATION WORKFLOW
 # ============================================================
 
 if uploaded_file is not None:
 
     try:
 
-        # ====================================================
-        # READ LAS FILE
-        # ====================================================
+        # ----------------------------------------------------
+        # LOAD LAS
+        # ----------------------------------------------------
 
-        st.subheader(
-            "📥 LAS File Processing"
-        )
-
-        las_string = uploaded_file.getvalue().decode(
-            "utf-8",
-            errors="ignore"
-        )
-
-        las_file = StringIO(
-            las_string
-        )
-
-        las = lasio.read(
-            las_file,
-            engine="normal"
+        las = load_las_file(
+            uploaded_file
         )
 
         st.success(
-            "✅ LAS file loaded successfully!"
+            "✅ LAS file loaded successfully."
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # WELL INFORMATION
-        # ====================================================
+        # ----------------------------------------------------
+
+        well_name, company = get_well_information(
+            las
+        )
 
         st.subheader(
             "🏭 Well Information"
         )
-
-        if "WELL" in las.well:
-
-            well_name = str(
-                las.well.WELL.value
-            )
-
-        else:
-
-            well_name = "Unknown"
-
-        if "COMP" in las.well:
-
-            company = str(
-                las.well.COMP.value
-            )
-
-        else:
-
-            company = "Unknown"
 
         col1, col2 = st.columns(2)
 
         with col1:
 
             st.metric(
-                "Well Name",
+                "Well",
                 well_name
             )
 
@@ -251,121 +1195,82 @@ if uploaded_file is not None:
                 company
             )
 
-        # ====================================================
-        # AVAILABLE LOGS
-        # ====================================================
+        # ----------------------------------------------------
+        # DATAFRAME
+        # ----------------------------------------------------
+
+        df = las_to_dataframe(
+            las
+        )
+
+        depth_column = get_depth_column(
+            df
+        )
+
+        # ----------------------------------------------------
+        # AVAILABLE CURVES
+        # ----------------------------------------------------
 
         st.subheader(
-            "📋 Available Logs"
-        )
-
-        curve_names = [
-            curve.mnemonic
-            for curve in las.curves
-        ]
-
-        st.write(
-            curve_names
-        )
-
-        # ====================================================
-        # CONVERT LAS TO DATAFRAME
-        # ====================================================
-
-        df = las.df()
-
-        df.reset_index(
-            inplace=True
-        )
-
-        st.subheader(
-            "📊 Log Data Preview"
-        )
-
-        st.dataframe(
-            df.head(20),
-            width="stretch"
+            "📋 Available Curves"
         )
 
         st.write(
-            f"Number of depth samples: **{len(df)}**"
+            list(df.columns)
         )
 
-        # ====================================================
+        # ----------------------------------------------------
+        # DATA PREVIEW
+        # ----------------------------------------------------
+
+        with st.expander(
+            "View LAS Data Preview"
+        ):
+
+            st.dataframe(
+                df.head(20),
+                width="stretch"
+            )
+
+        # ----------------------------------------------------
         # FORMATION EVALUATION
-        # ====================================================
+        # ----------------------------------------------------
+
+        df, average_vsh = calculate_vsh(
+            df
+        )
+
+        df = calculate_reservoir_flag(
+            df,
+            vsh_cutoff
+        )
+
+        ntg = calculate_ntg(
+            df
+        )
+
+        # ----------------------------------------------------
+        # METRICS
+        # ----------------------------------------------------
 
         st.subheader(
             "🧮 Formation Evaluation"
         )
-
-        avg_vsh = 0.0
-
-        ntg = 0.0
-
-        if "GR" in df.columns:
-
-            gr_min = df["GR"].min()
-
-            gr_max = df["GR"].max()
-
-            if gr_max != gr_min:
-
-                df["VSH"] = (
-                    (df["GR"] - gr_min)
-                    /
-                    (gr_max - gr_min)
-                )
-
-                df["VSH"] = df["VSH"].clip(
-                    0,
-                    1
-                )
-
-                df["RES_FLAG"] = np.where(
-                    df["VSH"] < vsh_cutoff,
-                    1,
-                    0
-                )
-
-                ntg = float(
-                    df["RES_FLAG"].mean()
-                )
-
-                avg_vsh = float(
-                    df["VSH"].mean()
-                )
-
-            else:
-
-                st.warning(
-                    "GR values are constant, so VSH cannot be calculated."
-                )
-
-        else:
-
-            st.warning(
-                "⚠️ No GR log found. VSH and NTG cannot be calculated."
-            )
-
-        # ====================================================
-        # FORMATION EVALUATION METRICS
-        # ====================================================
 
         col1, col2, col3 = st.columns(3)
 
         with col1:
 
             st.metric(
-                "Net-to-Gross",
-                f"{ntg:.2f}"
+                "Average VSH",
+                f"{average_vsh:.3f}"
             )
 
         with col2:
 
             st.metric(
-                "Average VSH",
-                f"{avg_vsh:.2f}"
+                "Net-to-Gross",
+                f"{ntg:.3f}"
             )
 
         with col3:
@@ -375,659 +1280,177 @@ if uploaded_file is not None:
                 f"{len(df):,}"
             )
 
-        # ====================================================
-        # INTERACTIVE WELL LOG VISUALIZATION
-        # ====================================================
+        # ----------------------------------------------------
+        # RESISTIVITY DETECTION
+        # ----------------------------------------------------
 
-        st.subheader(
-            "📈 Interactive Well Log Visualization"
+        resistivity_curve = find_resistivity_curve(
+            df
         )
 
-        depth = df.iloc[:, 0]
-
-        fig = make_subplots(
-            rows=1,
-            cols=4,
-            shared_yaxes=True,
-            horizontal_spacing=0.03,
-            subplot_titles=(
-                "Gamma Ray",
-                "Resistivity",
-                "Density / Porosity",
-                "VSH"
-            )
-        )
-
-        # ====================================================
-        # TRACK 1 — GAMMA RAY
-        # ====================================================
-
-        if "GR" in df.columns:
-
-            fig.add_trace(
-                go.Scatter(
-                    x=df["GR"],
-                    y=depth,
-                    mode="lines",
-                    name="GR",
-                    line=dict(
-                        color="green"
-                    )
-                ),
-                row=1,
-                col=1
-            )
-
-            fig.add_vline(
-                x=gr_cutoff,
-                line_width=2,
-                line_dash="dash",
-                line_color="red",
-                row=1,
-                col=1
-            )
-
-            fig.update_xaxes(
-                title_text="GR",
-                row=1,
-                col=1
-            )
-
-        # ====================================================
-        # TRACK 2 — RESISTIVITY
-        # ====================================================
-
-        resistivity_keywords = [
-            "RT",
-            "RES",
-            "ILD",
-            "LLD",
-            "RDEP",
-            "AT90",
-            "RESD",
-            "LLS",
-            "MSFL",
-            "RXO",
-            "RILD"
-        ]
-
-        res_curve = None
-
-        for column in df.columns:
-
-            column_upper = str(
-                column
-            ).upper()
-
-            for keyword in resistivity_keywords:
-
-                if keyword in column_upper:
-
-                    res_curve = column
-
-                    break
-
-            if res_curve is not None:
-
-                break
-
-        if res_curve is not None:
+        if resistivity_curve:
 
             st.success(
-                f"✅ Detected Resistivity Curve: {res_curve}"
-            )
-
-            fig.add_trace(
-                go.Scatter(
-                    x=df[res_curve],
-                    y=depth,
-                    mode="lines",
-                    name=str(res_curve),
-                    line=dict(
-                        color="red"
-                    )
-                ),
-                row=1,
-                col=2
-            )
-
-            fig.update_xaxes(
-                type="log",
-                title_text="Resistivity",
-                row=1,
-                col=2
+                f"Resistivity detected: "
+                f"{resistivity_curve}"
             )
 
         else:
 
             st.warning(
-                "⚠️ No resistivity log detected."
+                "No resistivity curve detected."
             )
 
-        # ====================================================
-        # TRACK 3 — DENSITY
-        # ====================================================
-
-        if "RHOB" in df.columns:
-
-            fig.add_trace(
-                go.Scatter(
-                    x=df["RHOB"],
-                    y=depth,
-                    mode="lines",
-                    name="RHOB",
-                    line=dict(
-                        color="blue"
-                    )
-                ),
-                row=1,
-                col=3
-            )
-
-            fig.update_xaxes(
-                title_text="RHOB",
-                row=1,
-                col=3
-            )
-
-        else:
-
-            st.warning(
-                "⚠️ No RHOB log detected."
-            )
-
-        # ====================================================
-        # TRACK 4 — VSH
-        # ====================================================
-
-        if "VSH" in df.columns:
-
-            fig.add_trace(
-                go.Scatter(
-                    x=df["VSH"],
-                    y=depth,
-                    mode="lines",
-                    name="VSH",
-                    line=dict(
-                        color="black"
-                    )
-                ),
-                row=1,
-                col=4
-            )
-
-            fig.update_xaxes(
-                range=[0, 1],
-                title_text="VSH",
-                row=1,
-                col=4
-            )
-
-        # ====================================================
-        # FIGURE LAYOUT
-        # ====================================================
-
-        fig.update_layout(
-            height=900,
-            width=1200,
-            showlegend=True
-        )
-
-        fig.update_yaxes(
-            title_text="Depth",
-            autorange="reversed",
-            row=1,
-            col=1
-        )
-
-        st.plotly_chart(
-            fig,
-            width="stretch"
-        )
-
-        # ====================================================
-        # SAVE ANALYSIS TO DATABASE
-        # ====================================================
+        # ----------------------------------------------------
+        # INTERACTIVE CANVAS
+        # ----------------------------------------------------
 
         st.subheader(
-            "💾 Save Well Analysis"
+            "🖥️ Interactive Well Log Canvas"
         )
 
-        st.write(
-            "Save the current well and formation evaluation "
-            "results to the local SQLite database."
+        render_well_log_canvas(
+            df=df,
+            depth_column=depth_column,
+            gr_cutoff=gr_cutoff,
+            vsh_cutoff=vsh_cutoff,
+            resistivity_curve=resistivity_curve
         )
 
-        if st.button(
-            "💾 Save Well Analysis to Database",
-            type="primary"
-        ):
-
-            save_well_to_database(
-                well_name=well_name,
-                company=company,
-                depth_samples=int(len(df)),
-                average_vsh=float(avg_vsh),
-                net_to_gross=float(ntg)
-            )
-
-            st.success(
-                f"✅ {well_name} successfully saved to the database."
-            )
-
-        # ====================================================
-        # FORMATION EVALUATION TABLE
-        # ====================================================
+        # ----------------------------------------------------
+        # FORMATION SUMMARY
+        # ----------------------------------------------------
 
         st.subheader(
             "📋 Formation Evaluation Summary"
         )
 
-        evaluation_data = {
-            "Parameter": [
-                "Well Name",
-                "Company",
-                "Depth Samples",
-                "GR Cutoff",
-                "VSH Cutoff",
-                "Average VSH",
-                "Net-to-Gross"
-            ],
-            "Value": [
-                well_name,
-                company,
-                len(df),
-                gr_cutoff,
-                vsh_cutoff,
-                round(avg_vsh, 3),
-                round(ntg, 3)
-            ]
-        }
-
-        evaluation_df = pd.DataFrame(
-            evaluation_data
+        summary_df = pd.DataFrame(
+            {
+                "Parameter": [
+                    "Well",
+                    "Company",
+                    "Depth Samples",
+                    "GR Cutoff",
+                    "VSH Cutoff",
+                    "Average VSH",
+                    "Net-to-Gross"
+                ],
+                "Value": [
+                    well_name,
+                    company,
+                    len(df),
+                    gr_cutoff,
+                    vsh_cutoff,
+                    round(
+                        average_vsh,
+                        3
+                    ),
+                    round(
+                        ntg,
+                        3
+                    )
+                ]
+            }
         )
 
         st.dataframe(
-            evaluation_df,
+            summary_df,
             width="stretch",
             hide_index=True
         )
 
-        # ====================================================
-        # AI LITHOLOGY PREDICTION
-        # ====================================================
+        # ----------------------------------------------------
+        # SAVE TO DATABASE
+        # ----------------------------------------------------
 
         st.subheader(
-            "🤖 AI Lithology Prediction"
+            "💾 Save Well Analysis"
         )
 
-        st.write(
-            "A Random Forest classifier is trained using "
-            "GR, RHOB and NPHI. For this prototype, the "
-            "training labels are generated from the selected "
-            "GR cutoff."
-        )
+        if st.button(
+            "Save Well Analysis",
+            type="primary"
+        ):
 
-        required_curves = [
-            "GR",
-            "RHOB",
-            "NPHI"
-        ]
-
-        missing_curves = [
-            curve
-            for curve in required_curves
-            if curve not in df.columns
-        ]
-
-        if len(missing_curves) == 0:
-
-            ai_df = df[
-                required_curves
-            ].copy()
-
-            ai_df.replace(
-                [np.inf, -np.inf],
-                np.nan,
-                inplace=True
+            save_well_analysis(
+                well_name=well_name,
+                company=company,
+                depth_samples=len(df),
+                average_vsh=average_vsh,
+                net_to_gross=ntg
             )
 
-            ai_df.dropna(
-                inplace=True
+            st.success(
+                f"✅ {well_name} saved successfully."
             )
 
-            if len(ai_df) >= 20:
-
-                # --------------------------------------------
-                # GENERATE EDUCATIONAL TRAINING LABELS
-                # --------------------------------------------
-
-                ai_df["Lithology"] = np.where(
-                    ai_df["GR"] < gr_cutoff,
-                    1,
-                    0
-                )
-
-                X = ai_df[
-                    [
-                        "GR",
-                        "RHOB",
-                        "NPHI"
-                    ]
-                ]
-
-                y = ai_df[
-                    "Lithology"
-                ]
-
-                if y.nunique() >= 2:
-
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        X,
-                        y,
-                        test_size=0.2,
-                        random_state=42,
-                        stratify=y
-                    )
-
-                    # ----------------------------------------
-                    # RANDOM FOREST MODEL
-                    # ----------------------------------------
-
-                    model = RandomForestClassifier(
-                        n_estimators=100,
-                        random_state=42
-                    )
-
-                    model.fit(
-                        X_train,
-                        y_train
-                    )
-
-                    # ----------------------------------------
-                    # MODEL ACCURACY
-                    # ----------------------------------------
-
-                    y_pred = model.predict(
-                        X_test
-                    )
-
-                    accuracy = accuracy_score(
-                        y_test,
-                        y_pred
-                    )
-
-                    st.metric(
-                        "AI Model Accuracy",
-                        f"{accuracy * 100:.2f}%"
-                    )
-
-                    # ----------------------------------------
-                    # WHOLE WELL PREDICTION
-                    # ----------------------------------------
-
-                    ai_df["Predicted_Lithology"] = model.predict(
-                        X
-                    )
-
-                    # ----------------------------------------
-                    # PREDICTION SUMMARY
-                    # ----------------------------------------
-
-                    sand_count = int(
-                        (
-                            ai_df["Predicted_Lithology"] == 1
-                        ).sum()
-                    )
-
-                    shale_count = int(
-                        (
-                            ai_df["Predicted_Lithology"] == 0
-                        ).sum()
-                    )
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-
-                        st.metric(
-                            "Predicted Sand Samples",
-                            sand_count
-                        )
-
-                    with col2:
-
-                        st.metric(
-                            "Predicted Shale Samples",
-                            shale_count
-                        )
-
-                    # ----------------------------------------
-                    # AI LITHOLOGY PLOT
-                    # ----------------------------------------
-
-                    fig_ai, ax = plt.subplots(
-                        figsize=(6, 10)
-                    )
-
-                    scatter = ax.scatter(
-                        ai_df["Predicted_Lithology"],
-                        ai_df.index,
-                        c=ai_df["Predicted_Lithology"],
-                        cmap="viridis",
-                        s=12
-                    )
-
-                    ax.set_xlabel(
-                        "Predicted Lithology"
-                    )
-
-                    ax.set_ylabel(
-                        "Sample Index"
-                    )
-
-                    ax.set_title(
-                        "AI Lithology Prediction"
-                    )
-
-                    ax.invert_yaxis()
-
-                    ax.set_xticks(
-                        [0, 1]
-                    )
-
-                    ax.set_xticklabels(
-                        [
-                            "Shale",
-                            "Sand"
-                        ]
-                    )
-
-                    st.pyplot(
-                        fig_ai
-                    )
-
-                    # ----------------------------------------
-                    # FEATURE IMPORTANCE
-                    # ----------------------------------------
-
-                    st.write(
-                        "### Feature Importance"
-                    )
-
-                    feature_importance = pd.DataFrame(
-                        {
-                            "Feature": [
-                                "GR",
-                                "RHOB",
-                                "NPHI"
-                            ],
-                            "Importance": model.feature_importances_
-                        }
-                    )
-
-                    feature_importance = feature_importance.sort_values(
-                        "Importance",
-                        ascending=False
-                    )
-
-                    st.dataframe(
-                        feature_importance,
-                        width="stretch",
-                        hide_index=True
-                    )
-
-                    st.info(
-                        "Note: This AI workflow is an educational prototype. "
-                        "The training labels are generated from the GR cutoff "
-                        "rather than from laboratory core or expert-labelled "
-                        "facies data. Therefore, the reported accuracy should "
-                        "not be interpreted as professional geological model "
-                        "validation."
-                    )
-
-                else:
-
-                    st.warning(
-                        "AI prediction requires at least two lithology classes "
-                        "in the training data. Adjust the GR cutoff."
-                    )
-
-            else:
-
-                st.warning(
-                    "Not enough valid samples are available for AI training."
-                )
-
-        else:
-
-            st.warning(
-                "AI lithology prediction requires these curves: "
-                "GR, RHOB and NPHI."
-            )
-
-            st.write(
-                "Missing curves:",
-                missing_curves
-            )
-
-        # ====================================================
-        # SAVED WELL DATABASE
-        # ====================================================
+        # ----------------------------------------------------
+        # AI
+        # ----------------------------------------------------
 
         st.divider()
 
-        st.subheader(
-            "🗄️ Saved Well Database"
+        display_ai_lithology(
+            df,
+            gr_cutoff
         )
 
-        saved_wells = load_saved_wells()
+        # ----------------------------------------------------
+        # DATABASE
+        # ----------------------------------------------------
 
-        if not saved_wells.empty:
+        st.divider()
 
-            st.dataframe(
-                saved_wells,
-                width="stretch",
-                hide_index=True
-            )
+        display_multi_well_analysis()
 
-            # -----------------------------------------------
-            # MULTI-WELL ANALYSIS
-            # -----------------------------------------------
-
-            st.subheader(
-                "📊 Multi-Well Analysis"
-            )
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                fig_ntg = go.Figure()
-
-                fig_ntg.add_trace(
-                    go.Bar(
-                        x=saved_wells["well_name"],
-                        y=saved_wells["net_to_gross"],
-                        name="NTG"
-                    )
-                )
-
-                fig_ntg.update_layout(
-                    title="Net-to-Gross Comparison",
-                    xaxis_title="Well",
-                    yaxis_title="Net-to-Gross"
-                )
-
-                st.plotly_chart(
-                    fig_ntg,
-                    width="stretch"
-                )
-
-            with col2:
-
-                fig_vsh = go.Figure()
-
-                fig_vsh.add_trace(
-                    go.Bar(
-                        x=saved_wells["well_name"],
-                        y=saved_wells["average_vsh"],
-                        name="Average VSH"
-                    )
-                )
-
-                fig_vsh.update_layout(
-                    title="Average VSH Comparison",
-                    xaxis_title="Well",
-                    yaxis_title="Average VSH"
-                )
-
-                st.plotly_chart(
-                    fig_vsh,
-                    width="stretch"
-                )
-
-        else:
-
-            st.info(
-                "No wells have been saved to the database yet."
-            )
-
-    except Exception as e:
+    except Exception as error:
 
         st.error(
-            "❌ An error occurred while processing the LAS file."
+            "❌ PetroDashboard encountered an error "
+            "while processing the LAS file."
         )
 
         st.exception(
-            e
+            error
         )
 
 
 # ============================================================
-# NO FILE UPLOADED
+# 27. EMPTY STATE
 # ============================================================
 
 else:
 
     st.info(
-        "👆 Upload a LAS file above to start the well log analysis."
+        "👆 Upload a LAS file to begin."
     )
 
     st.markdown(
         """
-        ### PetroDashboard Features
+        ### PetroDashboard
 
-        - 📂 LAS well log upload
-        - 🏭 Well information extraction
-        - 📋 Available log identification
-        - 📈 Interactive well log visualization
-        - 🧮 VSH calculation
-        - 🪨 Net-to-Gross calculation
-        - 🛢️ Resistivity detection
-        - 💾 SQLite well database
-        - 📊 Multi-well comparison
-        - 🤖 Random Forest lithology prototype
+        **Current capabilities**
+
+        - LAS well-log processing
+        - Automatic curve detection
+        - Interactive multi-track visualization
+        - Gamma Ray analysis
+        - Resistivity analysis
+        - Density / neutron visualization
+        - VSH calculation
+        - Net-to-Gross calculation
+        - Reservoir interval identification
+        - SQLite well database
+        - Multi-well comparison
+        - AI lithology prototype
+
+        **Visualization architecture**
+
+        PetroDashboard uses an interactive Plotly-based
+        well-log canvas with shared depth, crosshair
+        interaction, logarithmic resistivity scaling,
+        reservoir interpretation and visualization
+        decimation.
         """
     )
